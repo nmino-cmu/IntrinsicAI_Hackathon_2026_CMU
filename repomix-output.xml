@@ -468,6 +468,7 @@ our_docker_image/
 .gitattributes
 .gitignore
 .isort.cfg
+a.txt
 aic.repos
 LICENSE
 pixi_env_setup.sh
@@ -27563,6 +27564,10 @@ ros2 bag record -o my_recording /aic_controller/state /camera/image
 </file>
 
 <file path="our_docker_image/placeholder.txt">
+
+</file>
+
+<file path="a.txt">
 
 </file>
 
@@ -54849,6 +54854,135 @@ namespace aic_scoring
 #endif
 </file>
 
+<file path="docker/aic_eval/Dockerfile">
+FROM ros:kilted-ros-base
+
+# Add `packages.osrfoundation.org` to the apt sources list:
+RUN curl https://packages.osrfoundation.org/gazebo.gpg --output /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg && \
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null
+
+# Install dependencies
+RUN mkdir -p /ws_aic/src/aic
+COPY --chmod=644 aic.repos /ws_aic/src/aic/
+COPY --chmod=u=rwX,go=rX --parents **/package.xml /ws_aic/src/aic
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked --mount=type=cache,target=/var/lib/apt,sharing=locked \
+  apt update && apt upgrade -y && \
+  # undeclared deps
+  apt install python3-numpy && \
+  cd /ws_aic/src && \
+  vcs import . < /ws_aic/src/aic/aic.repos --recursive && \
+  # Install Gazebo dependencies.
+  apt -y install $(sort -u $(find . -iname 'packages-'`lsb_release -cs`'.apt' -o -iname 'packages.apt' | grep -v '/\.git/') | sed '/gz\|sdf/d' | tr '\n' ' ') && \
+  cd /ws_aic && \
+  # Install ROS dependencies using rosdep.
+  rosdep install --from-paths src --ignore-src --rosdistro kilted -yr --skip-keys "gz-cmake3 DART libogre-dev libogre-next-2.3-dev"
+
+# Build the workspace
+COPY --chmod=u=rwX,go=rX --exclude=docker . /ws_aic/src/aic
+SHELL ["/bin/bash", "-c"]
+RUN --mount=type=cache,target=/ws_aic/build,sharing=locked \
+  cd /ws_aic \
+  && . /opt/ros/kilted/setup.bash \
+  && GZ_BUILD_FROM_SOURCE=1 colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release --merge-install --executor sequential \
+  && rm -rf /ws_aic/log /ws_aic/src
+
+COPY --chmod=644 docker/aic_eval/aic_zenoh_config.json5 /aic_zenoh_config.json5
+COPY --chmod=755 <<"EOF" /entrypoint.sh
+#!/bin/bash
+set -e
+
+. /ws_aic/install/setup.bash
+export RMW_IMPLEMENTATION=rmw_zenoh_cpp
+
+should_enable_acl() {
+  [[ "$AIC_ENABLE_ACL" == "true" || "$AIC_ENABLE_ACL" == "1" ]]
+}
+
+# prepare the credentials file
+if should_enable_acl; then
+  if [[ ! (-n "$AIC_EVAL_PASSWD" && -n "AIC_MODEL_PASSWD") ]]; then
+    echo "AIC_EVAL_PASSWD, AIC_MODEL_PASSWD must be provided"
+    exit 1
+  fi
+  echo "eval:$AIC_EVAL_PASSWD" >> /credentials.txt
+  echo "model:$AIC_MODEL_PASSWD" >> /credentials.txt
+fi
+
+# Both the router and peer processes will use the same config, regardless
+# of whether the ACL is enabled.
+export ZENOH_ROUTER_CONFIG_URI=/aic_zenoh_config.json5
+
+# start the model router
+ZENOH_CONFIG_OVERRIDE='mode="router"'
+ZENOH_CONFIG_OVERRIDE+=';listen/endpoints=["tcp/[::]:7447"]'
+ZENOH_CONFIG_OVERRIDE+=';connect/endpoints=[]'
+ZENOH_CONFIG_OVERRIDE+=';routing/router/peers_failover_brokering=true'
+ZENOH_CONFIG_OVERRIDE+=';transport/shared_memory/enabled=false'
+if should_enable_acl; then
+  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/user="eval"'
+  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/password="'"$AIC_EVAL_PASSWD"'"'
+  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/dictionary_file="/credentials.txt"'
+fi
+export ZENOH_CONFIG_OVERRIDE
+echo "ZENOH_CONFIG_OVERRIDE_ROUTER=$ZENOH_CONFIG_OVERRIDE"
+ros2 run rmw_zenoh_cpp rmw_zenohd &
+ZENOH_ROUTER_PID=$!
+
+trap "kill -SIGINT -$ZENOH_EVAL_ROUTER_PID -$ZENOH_ROUTER_PID" EXIT
+
+# start the evaluator
+ZENOH_CONFIG_OVERRIDE=';transport/shared_memory/enabled=false'
+if should_enable_acl; then
+  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/user="eval"'
+  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/password="'"$AIC_EVAL_PASSWD"'"'
+  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/dictionary_file="/credentials.txt"'
+fi
+export ZENOH_CONFIG_OVERRIDE
+echo "ZENOH_CONFIG_OVERRIDE_PEER=$ZENOH_CONFIG_OVERRIDE"
+exec ros2 launch aic_bringup aic_gz_bringup.launch.py "$@"
+EOF
+
+# Contary to the name, `/entrypoint.sh` is not actually the entrypoint.
+# The name is kept to maintain compatibility as the old entrypoint script does not have ACL.
+ENTRYPOINT ["/entrypoint.sh"]
+</file>
+
+<file path="docker/docker-compose.yaml">
+name: aic
+services:
+  eval:
+    image: ghcr.io/intrinsic-dev/aic/aic_eval
+    # image: my-eval:v1
+    build:
+      dockerfile: docker/aic_eval/Dockerfile
+      context: ..
+    command: gazebo_gui:=false launch_rviz:=false ground_truth:=false start_aic_engine:=true shutdown_on_aic_engine_exit:=true
+    gpus: all
+    networks:
+      - default
+    environment:
+      AIC_EVAL_PASSWD: CHANGE_IN_PROD
+      AIC_MODEL_PASSWD: CHANGE_IN_PROD
+      # AIC_ENABLE_ACL: true
+  model:
+    image: my-solution:v1
+    build:
+      dockerfile: docker/aic_model/Dockerfile
+      context: ..
+    gpus: all
+    networks:
+      - default
+    environment:
+      RMW_IMPLEMENTATION: rmw_zenoh_cpp
+      ZENOH_ROUTER_CHECK_ATTEMPTS: -1
+      AIC_ROUTER_ADDR: eval:7447
+      AIC_MODEL_PASSWD: CHANGE_IN_PROD
+      # AIC_ENABLE_ACL: true
+networks:
+  default:
+    internal: true
+</file>
+
 <file path="docs/scene_description.md">
 # Scene Description
 
@@ -55024,45 +55158,38 @@ Now that you understand the scene:
 - **Explore example policies:** Check out [`aic_example_policies/`](../aic_example_policies/)
 </file>
 
-<file path="docker/aic_eval/Dockerfile">
-FROM ros:kilted-ros-base
+<file path="docker/aic_model/Dockerfile">
+FROM docker.io/library/ros:kilted-ros-core AS build
 
-# Add `packages.osrfoundation.org` to the apt sources list:
-RUN curl https://packages.osrfoundation.org/gazebo.gpg --output /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg && \
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null
+# Install pixi
+RUN apt update && apt install -y git && curl -fsSL https://pixi.sh/install.sh | bash
+ENV PATH="/root/.pixi/bin:$PATH"
 
-# Install dependencies
-RUN mkdir -p /ws_aic/src/aic
-COPY --chmod=644 aic.repos /ws_aic/src/aic/
-COPY --chmod=u=rwX,go=rX --parents **/package.xml /ws_aic/src/aic
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked --mount=type=cache,target=/var/lib/apt,sharing=locked \
-  apt update && apt upgrade -y && \
-  # undeclared deps
-  apt install python3-numpy && \
-  cd /ws_aic/src && \
-  vcs import . < /ws_aic/src/aic/aic.repos --recursive && \
-  # Install Gazebo dependencies.
-  apt -y install $(sort -u $(find . -iname 'packages-'`lsb_release -cs`'.apt' -o -iname 'packages.apt' | grep -v '/\.git/') | sed '/gz\|sdf/d' | tr '\n' ' ') && \
-  cd /ws_aic && \
-  # Install ROS dependencies using rosdep.
-  rosdep install --from-paths src --ignore-src --rosdistro kilted -yr --skip-keys "gz-cmake3 DART libogre-dev libogre-next-2.3-dev"
+# Add base dependencies
+COPY aic_example_policies /ws_aic/src/aic/aic_example_policies
+COPY aic_model /ws_aic/src/aic/aic_model
+COPY aic_interfaces /ws_aic/src/aic/aic_interfaces
+COPY aic_utils /ws_aic/src/aic/aic_utils
+COPY pixi.toml pixi.lock /ws_aic/src/aic/
+COPY pixi_env_setup.sh /ws_aic/src/aic/
 
-# Build the workspace
-COPY --chmod=u=rwX,go=rX --exclude=docker . /ws_aic/src/aic
+# Add other dependencies
+
 SHELL ["/bin/bash", "-c"]
-RUN --mount=type=cache,target=/ws_aic/build,sharing=locked \
-  cd /ws_aic \
-  && . /opt/ros/kilted/setup.bash \
-  && GZ_BUILD_FROM_SOURCE=1 colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release --merge-install --executor sequential \
-  && rm -rf /ws_aic/log /ws_aic/src
+RUN --mount=type=cache,target=/root/.cache/rattler/cache --mount=type=cache,target=/ws_aic/src/aic/.pixi/build \
+    cd /ws_aic/src/aic && pixi install --locked
 
-COPY --chmod=644 docker/aic_eval/aic_zenoh_config.json5 /aic_zenoh_config.json5
+WORKDIR /ws_aic/src/aic
 COPY --chmod=755 <<"EOF" /entrypoint.sh
 #!/bin/bash
 set -e
 
-. /ws_aic/install/setup.bash
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
+
+if [[ -z "$AIC_ROUTER_ADDR" ]]; then
+  echo "AIC_ROUTER_ADDR must be provided"
+  exit 1
+fi
 
 should_enable_acl() {
   [[ "$AIC_ENABLE_ACL" == "true" || "$AIC_ENABLE_ACL" == "1" ]]
@@ -55070,87 +55197,28 @@ should_enable_acl() {
 
 # prepare the credentials file
 if should_enable_acl; then
-  if [[ ! (-n "$AIC_EVAL_PASSWD" && -n "AIC_MODEL_PASSWD") ]]; then
-    echo "AIC_EVAL_PASSWD, AIC_MODEL_PASSWD must be provided"
+  if [[ ! (-n "$AIC_MODEL_PASSWD" ) ]]; then
+    echo "AIC_MODEL_PASSWD must be provided"
     exit 1
   fi
-  echo "eval:$AIC_EVAL_PASSWD" >> /credentials.txt
   echo "model:$AIC_MODEL_PASSWD" >> /credentials.txt
 fi
 
-# Both the router and peer processes will use the same config, regardless
-# of whether the ACL is enabled.
-export ZENOH_ROUTER_CONFIG_URI=/aic_zenoh_config.json5
-
-# start the model router
-ZENOH_CONFIG_OVERRIDE='mode="router"'
-ZENOH_CONFIG_OVERRIDE+=';listen/endpoints=["tcp/[::]:7447"]'
-ZENOH_CONFIG_OVERRIDE+=';connect/endpoints=[]'
-ZENOH_CONFIG_OVERRIDE+=';routing/router/peers_failover_brokering=true'
+# start the model
+ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/'"$AIC_ROUTER_ADDR"'"]'
 ZENOH_CONFIG_OVERRIDE+=';transport/shared_memory/enabled=false'
 if should_enable_acl; then
-  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/user="eval"'
-  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/password="'"$AIC_EVAL_PASSWD"'"'
+  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/user="model"'
+  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/password="'"$AIC_MODEL_PASSWD"'"'
   ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/dictionary_file="/credentials.txt"'
 fi
 export ZENOH_CONFIG_OVERRIDE
-echo "ZENOH_CONFIG_OVERRIDE_ROUTER=$ZENOH_CONFIG_OVERRIDE"
-ros2 run rmw_zenoh_cpp rmw_zenohd &
-ZENOH_ROUTER_PID=$!
-
-trap "kill -SIGINT -$ZENOH_EVAL_ROUTER_PID -$ZENOH_ROUTER_PID" EXIT
-
-# start the evaluator
-ZENOH_CONFIG_OVERRIDE=';transport/shared_memory/enabled=false'
-if should_enable_acl; then
-  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/user="eval"'
-  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/password="'"$AIC_EVAL_PASSWD"'"'
-  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/dictionary_file="/credentials.txt"'
-fi
-export ZENOH_CONFIG_OVERRIDE
-echo "ZENOH_CONFIG_OVERRIDE_PEER=$ZENOH_CONFIG_OVERRIDE"
-exec ros2 launch aic_bringup aic_gz_bringup.launch.py "$@"
+echo "ZENOH_CONFIG_OVERRIDE=$ZENOH_CONFIG_OVERRIDE"
+exec pixi run --as-is ros2 run aic_model aic_model "$@"
 EOF
 
-# Contary to the name, `/entrypoint.sh` is not actually the entrypoint.
-# The name is kept to maintain compatibility as the old entrypoint script does not have ACL.
 ENTRYPOINT ["/entrypoint.sh"]
-</file>
-
-<file path="docker/docker-compose.yaml">
-name: aic
-services:
-  eval:
-    image: ghcr.io/intrinsic-dev/aic/aic_eval
-    # image: my-eval:v1
-    build:
-      dockerfile: docker/aic_eval/Dockerfile
-      context: ..
-    command: gazebo_gui:=false launch_rviz:=false ground_truth:=false start_aic_engine:=true shutdown_on_aic_engine_exit:=true
-    gpus: all
-    networks:
-      - default
-    environment:
-      AIC_EVAL_PASSWD: CHANGE_IN_PROD
-      AIC_MODEL_PASSWD: CHANGE_IN_PROD
-      # AIC_ENABLE_ACL: true
-  model:
-    image: my-solution:v1
-    build:
-      dockerfile: docker/aic_model/Dockerfile
-      context: ..
-    gpus: all
-    networks:
-      - default
-    environment:
-      RMW_IMPLEMENTATION: rmw_zenoh_cpp
-      ZENOH_ROUTER_CHECK_ATTEMPTS: -1
-      AIC_ROUTER_ADDR: eval:7447
-      AIC_MODEL_PASSWD: CHANGE_IN_PROD
-      # AIC_ENABLE_ACL: true
-networks:
-  default:
-    internal: true
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.CheatCode"]
 </file>
 
 <file path="docs/getting_started.md">
@@ -55622,69 +55690,6 @@ In this tutorial, you have learned how to:
 - Prepare a Docker image for your policy for submission.
 
 You are now equipped with the fundamental skills to develop, test, and submit your own policies for the AI for Industry Challenge. Feel free to explore the provided example policies and other documentation for more advanced concepts and inspiration.
-</file>
-
-<file path="docker/aic_model/Dockerfile">
-FROM docker.io/library/ros:kilted-ros-core AS build
-
-# Install pixi
-RUN apt update && apt install -y git && curl -fsSL https://pixi.sh/install.sh | bash
-ENV PATH="/root/.pixi/bin:$PATH"
-
-# Add base dependencies
-COPY aic_example_policies /ws_aic/src/aic/aic_example_policies
-COPY aic_model /ws_aic/src/aic/aic_model
-COPY aic_interfaces /ws_aic/src/aic/aic_interfaces
-COPY aic_utils /ws_aic/src/aic/aic_utils
-COPY pixi.toml pixi.lock /ws_aic/src/aic/
-COPY pixi_env_setup.sh /ws_aic/src/aic/
-
-# Add other dependencies
-
-SHELL ["/bin/bash", "-c"]
-RUN --mount=type=cache,target=/root/.cache/rattler/cache --mount=type=cache,target=/ws_aic/src/aic/.pixi/build \
-    cd /ws_aic/src/aic && pixi install --locked
-
-WORKDIR /ws_aic/src/aic
-COPY --chmod=755 <<"EOF" /entrypoint.sh
-#!/bin/bash
-set -e
-
-export RMW_IMPLEMENTATION=rmw_zenoh_cpp
-
-if [[ -z "$AIC_ROUTER_ADDR" ]]; then
-  echo "AIC_ROUTER_ADDR must be provided"
-  exit 1
-fi
-
-should_enable_acl() {
-  [[ "$AIC_ENABLE_ACL" == "true" || "$AIC_ENABLE_ACL" == "1" ]]
-}
-
-# prepare the credentials file
-if should_enable_acl; then
-  if [[ ! (-n "$AIC_MODEL_PASSWD" ) ]]; then
-    echo "AIC_MODEL_PASSWD must be provided"
-    exit 1
-  fi
-  echo "model:$AIC_MODEL_PASSWD" >> /credentials.txt
-fi
-
-# start the model
-ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/'"$AIC_ROUTER_ADDR"'"]'
-ZENOH_CONFIG_OVERRIDE+=';transport/shared_memory/enabled=false'
-if should_enable_acl; then
-  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/user="model"'
-  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/password="'"$AIC_MODEL_PASSWD"'"'
-  ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/dictionary_file="/credentials.txt"'
-fi
-export ZENOH_CONFIG_OVERRIDE
-echo "ZENOH_CONFIG_OVERRIDE=$ZENOH_CONFIG_OVERRIDE"
-exec pixi run --as-is ros2 run aic_model aic_model "$@"
-EOF
-
-ENTRYPOINT ["/entrypoint.sh"]
-CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.CheatCode"]
 </file>
 
 <file path="README.md">
